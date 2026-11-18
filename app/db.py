@@ -65,6 +65,14 @@ class Database:
                     invalidated INTEGER NOT NULL DEFAULT 0,
                     invalidated_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS leak_reviews (
+                    review_id TEXT PRIMARY KEY,
+                    manifest_id TEXT NOT NULL,
+                    dataset_version INTEGER NOT NULL,
+                    supplement_json TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             row = self._conn.execute("SELECT COUNT(*) AS n FROM state").fetchone()
@@ -278,6 +286,103 @@ class Database:
         manifest = self.get_manifest(manifest_id)
         assert manifest is not None
         return manifest
+
+    def save_leak_review(
+        self,
+        manifest_id: str,
+        expected_version: int,
+        supplement: Dict[str, Any],
+        result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """把一次审查结论存档。
+
+        仅写 leak_reviews 审计表：不递增 dataset_version、不改输入、不改清单。
+        若审查期间输入版本变化或清单已失效（两者在同一 IMMEDIATE 事务内复核），
+        则拒绝存档并抛出 StaleVersionError——调用方不得把结论当作可用结论返回。
+        """
+        review_id = uuid.uuid4().hex
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT dataset_version FROM state WHERE id = 1"
+                ).fetchone()
+                if row["dataset_version"] != expected_version:
+                    raise StaleVersionError(
+                        f"审查期间输入已从 v{expected_version} 变动到"
+                        f" v{row['dataset_version']}，本次结论作废，请重新审查。"
+                    )
+                manifest_row = self._conn.execute(
+                    "SELECT dataset_version, invalidated FROM published_manifests"
+                    " WHERE manifest_id = ?",
+                    (manifest_id,),
+                ).fetchone()
+                if manifest_row is None:
+                    raise StaleVersionError("审查期间清单已不存在，本次结论作废。")
+                if manifest_row["invalidated"] or (
+                    manifest_row["dataset_version"] != expected_version
+                ):
+                    raise StaleVersionError(
+                        "审查期间清单已失效，本次结论作废，请重新选择有效清单。"
+                    )
+                created_at = _now()
+                self._conn.execute(
+                    "INSERT INTO leak_reviews (review_id, manifest_id,"
+                    " dataset_version, supplement_json, result_json, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        review_id,
+                        manifest_id,
+                        expected_version,
+                        json.dumps(supplement, ensure_ascii=False),
+                        json.dumps(result, ensure_ascii=False),
+                        created_at,
+                    ),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return {
+            "review_id": review_id,
+            "manifest_id": manifest_id,
+            "dataset_version": expected_version,
+            "created_at": created_at,
+        }
+
+    def list_leak_reviews(self, manifest_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        current_version = self.get_version()
+        with self._lock:
+            if manifest_id is None:
+                rows = self._conn.execute(
+                    "SELECT review_id, manifest_id, dataset_version, supplement_json,"
+                    " result_json, created_at FROM leak_reviews"
+                    " ORDER BY created_at DESC, review_id DESC LIMIT 50"
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT review_id, manifest_id, dataset_version, supplement_json,"
+                    " result_json, created_at FROM leak_reviews WHERE manifest_id = ?"
+                    " ORDER BY created_at DESC, review_id DESC LIMIT 50",
+                    (manifest_id,),
+                ).fetchall()
+        out = []
+        for r in rows:
+            result = json.loads(r["result_json"])
+            out.append(
+                {
+                    "review_id": r["review_id"],
+                    "manifest_id": r["manifest_id"],
+                    "dataset_version": r["dataset_version"],
+                    "current_version": current_version,
+                    "expired": r["dataset_version"] != current_version,
+                    "created_at": r["created_at"],
+                    "supplement": json.loads(r["supplement_json"]),
+                    "status": result.get("status"),
+                    "conclusion": result.get("conclusion"),
+                }
+            )
+        return out
 
     def version_log(self) -> List[Dict[str, Any]]:
         with self._lock:

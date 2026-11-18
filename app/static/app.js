@@ -50,6 +50,7 @@ document.querySelectorAll(".tab").forEach((btn) => {
     document.querySelectorAll(".panel").forEach((p) => p.classList.remove("active"));
     btn.classList.add("active");
     $("tab-" + btn.dataset.tab).classList.add("active");
+    if (btn.dataset.tab === "leak") loadLeakHistory();
   });
 });
 
@@ -135,6 +136,7 @@ function renderState() {
   }
   renderLocks();
   renderManifestTable();
+  renderLeakManifestSelect();
 }
 
 // --------------------------------------------------------------------------- //
@@ -373,6 +375,158 @@ async function downloadManifest(id) {
 }
 
 // --------------------------------------------------------------------------- //
+// 泄漏审查
+// --------------------------------------------------------------------------- //
+let lastLeakReview = null;
+
+function renderLeakManifestSelect() {
+  if (!currentState) return;
+  const select = $("leakManifest");
+  const prior = select.value;
+  const valid = currentState.manifests.filter((m) => !m.expired);
+  const options = valid.map((m) =>
+    `<option value="${escapeHtml(m.manifest_id)}">${escapeHtml(m.manifest_id.slice(0, 8))}… · v${m.dataset_version} · ${m.case_count ?? ""} 例 · ${escapeHtml(m.created_at)}</option>`
+  ).join("");
+  select.innerHTML = options ||
+    `<option value="">（没有有效清单，请先求解并发布）</option>`;
+  if (prior && valid.some((m) => m.manifest_id === prior)) select.value = prior;
+  const expiredCount = currentState.manifests.length - valid.length;
+  $("leakManifestHint").textContent = expiredCount > 0
+    ? `已隐去 ${expiredCount} 份失效清单（不可用于审查）。`
+    : "";
+  if (document.querySelector('[data-tab="leak"]').classList.contains("active")) {
+    loadLeakHistory();
+  }
+}
+
+async function loadLeakHistory() {
+  try {
+    const r = await api("/api/leak-reviews");
+    const rows = r.reviews.map((entry) => {
+      const ok = entry.status === "clean";
+      const staleNote = entry.expired
+        ? ` <span class="pill warn">输入已变动·历史结论</span>`
+        : "";
+      return `<tr>
+        <td><code>${escapeHtml(entry.review_id.slice(0, 8))}…</code></td>
+        <td><code>${escapeHtml(entry.manifest_id.slice(0, 8))}…</code></td>
+        <td>v${entry.dataset_version}</td>
+        <td>${entry.supplement.cases.length} 例 / ${entry.supplement.relatives.length} 对新增亲属</td>
+        <td><span class="pill ${ok ? "ok" : "warn"}">${escapeHtml(entry.status)}</span>
+          ${escapeHtml(entry.conclusion)}${staleNote}</td>
+        <td>${escapeHtml(entry.created_at)}</td></tr>`;
+    }).join("");
+    $("leakHistoryTable").querySelector("tbody").innerHTML = rows ||
+      `<tr><td colspan="6" class="hint">暂无审查记录</td></tr>`;
+  } catch (err) { /* 轮询/切页静默 */ }
+}
+
+async function runLeakReview() {
+  const manifestId = $("leakManifest").value;
+  if (!manifestId) return setMsg("leakMsg", "请先选择一份有效清单");
+  const casesFile = $("leakCasesFile").files[0];
+  if (!casesFile) return setMsg("leakMsg", "请先选择补充病例 CSV 文件");
+  const relFile = $("leakRelFile").files[0];
+
+  const fd = new FormData();
+  fd.append("manifest_id", manifestId);
+  fd.append("cases_file", casesFile);
+  if (relFile) fd.append("relatives_file", relFile);
+
+  setMsg("leakMsg", "审查中…");
+  $("leakResultBox").classList.add("hidden");
+  try {
+    const r = await api("/api/leak-review", { method: "POST", body: fd });
+    lastLeakReview = r;
+    renderLeakResult(r);
+    const res = r.result;
+    setMsg(
+      "leakMsg",
+      res.has_leakage
+        ? `审查完成：${res.leakage_case_count} 个补充病例存在跨组泄漏`
+        : (res.has_manifest_conflict
+          ? "审查完成：补充病例无跨组泄漏，但新增关系造成清单内部冲突"
+          : `审查完成：${res.clean_case_count} 个补充病例未发现跨组泄漏`),
+      !res.has_leakage && !res.has_manifest_conflict
+    );
+    loadLeakHistory();
+  } catch (err) {
+    setMsg("leakMsg", err.message);
+  }
+}
+
+function renderLeakResult(review) {
+  const res = review.result;
+  $("leakResultBox").classList.remove("hidden");
+  const banner = $("leakConclusion");
+  banner.className = "banner " + (
+    res.has_leakage ? "" : (res.has_manifest_conflict ? "warn" : "ok-banner")
+  );
+  banner.textContent = res.conclusion;
+
+  const stats = res.stats;
+  $("leakStats").innerHTML = [
+    ["补充病例", stats.supplement_case_count],
+    ["新增亲属对", stats.new_relative_count],
+    ["患者总数", stats.patient_count],
+    ["含两组的连通分量", stats.leak_component_count],
+  ].map(([k, v]) => `<div class="card"><b>${v}</b><span>${k}</span></div>`).join("");
+
+  // 受影响的补充病例 + 原始关系路径
+  $("leakAffectedBox").classList.toggle("hidden", !res.affected_supplement_cases.length);
+  $("leakAffected").innerHTML = res.affected_supplement_cases.map((item) => {
+    const paths = item.paths.map((p, i) => `
+      <li>
+        <div><b>${i + 1}.</b> 通向 ${escapeHtml(p.to_case.origin === "manifest" ? "清单" : "补充")}病例
+          <code>${escapeHtml(p.to_case.case_id)}</code>
+          （患者 <code>${escapeHtml(p.to_case.patient_id)}</code>，${escapeHtml(p.to_case.group_name)}）
+          · ${p.step_count} 步</div>
+        <div class="path-text">${escapeHtml(p.text)}</div>
+        <div class="rel-chips">${p.relations.map((rel) => rel.kind === "same_patient"
+          ? `<span class="chip same">同一患者 ${escapeHtml(rel.patient_id)}</span>`
+          : `<span class="chip ${rel.source === "supplement" ? "new" : ""}">${escapeHtml(rel.source_name)} ${escapeHtml(rel.patient_a)}–${escapeHtml(rel.patient_b)}</span>`
+        ).join(" → ")}</div>
+      </li>`).join("");
+    return `<div class="leak-card">
+      <h3>补充病例 <code>${escapeHtml(item.case_id)}</code>
+        （患者 ${escapeHtml(item.patient_id)}，目标${escapeHtml(item.target_group_name)}）</h3>
+      <p class="hint">该患者所在关系分量含 ${item.opposite_case_count} 个${escapeHtml(item.opposite_group_name)}病例
+        （清单 ${item.opposite_manifest_case_count} / 补充 ${item.opposite_supplement_case_count}）。
+        ${item.paths_truncated ? `仅展示最短的 ${item.paths.length} 条，另有 ${item.omitted_path_count} 条未展示。` : ""}</p>
+      <ol class="path-list">${paths}</ol>
+    </div>`;
+  }).join("");
+
+  // 新增关系造成的清单内部冲突
+  $("leakManifestConflictBox").classList.toggle(
+    "hidden", !res.manifest_internal_conflicts.length);
+  $("leakManifestConflicts").innerHTML = res.manifest_internal_conflicts.map((c) => {
+    const cause = c.caused_by_new_relations
+      ? `<span class="pill dead">新增关系造成</span> ${c.new_relations.map((r) =>
+          `<span class="chip new">${escapeHtml(r.patient_a)}–${escapeHtml(r.patient_b)}</span>`).join(" ")}`
+      : `<span class="pill warn">路径未使用新增关系</span>`;
+    return `<div class="leak-card">
+      <h3>清单病例 <code>${escapeHtml(c.case_a.case_id)}</code>（${escapeHtml(c.case_a.group_name)}）
+        ↔ <code>${escapeHtml(c.case_b.case_id)}</code>（${escapeHtml(c.case_b.group_name)}）</h3>
+      <div>${cause}</div>
+      <p class="hint">该连通分量共含 ${c.manifest_case_count} 个清单病例，
+        跨组配对 ${c.conflicting_pair_count} 对，此处仅展示最近的一对及其路径。</p>
+      <div class="path-text">${escapeHtml(c.path.text)}</div>
+    </div>`;
+  }).join("") + (res.manifest_conflicts_truncated
+    ? `<p class="hint">冲突分量较多，仅展示前 ${res.manifest_internal_conflicts.length} 个
+       （共 ${res.manifest_conflict_component_count} 个）。</p>` : "");
+
+  // 无泄漏的补充病例
+  $("leakCleanBox").classList.toggle("hidden", !res.clean_supplement_cases.length);
+  $("leakCleanTable").querySelector("tbody").innerHTML =
+    res.clean_supplement_cases.map((c) => `<tr>
+      <td>${escapeHtml(c.case_id)}</td>
+      <td>${escapeHtml(c.patient_id)}</td>
+      <td>${escapeHtml(c.target_group_name)}（${c.target_group}）</td></tr>`).join("");
+}
+
+// --------------------------------------------------------------------------- //
 // 版本日志
 // --------------------------------------------------------------------------- //
 async function loadVersionLog() {
@@ -403,6 +557,12 @@ async function refreshAll(showStaleBanner = false) {
       if (lastPreview && lastPreview.version !== currentVersion) {
         $("previewWarn").classList.remove("hidden");
         $("publishBtn").disabled = true;
+      }
+      if (changed && lastLeakReview) {
+        // 输入版本已变：上次审查结论对应旧版本，不再展示为当前结论
+        lastLeakReview = null;
+        $("leakResultBox").classList.add("hidden");
+        setMsg("leakMsg", "输入已变动，上次审查结论已过期，请重新审查。");
       }
     }
     if (lastPreview) renderSolveResult();

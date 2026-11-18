@@ -9,12 +9,17 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .db import Database, StaleVersionError
+from .leak_review import (
+    parse_supplement_cases_csv,
+    parse_supplement_relatives_csv,
+    review_leakage,
+)
 from .models import (
     ActiveInput,
     ValidationError,
@@ -282,6 +287,122 @@ def manifest_download(manifest_id: str):
 @app.get("/api/version-log")
 def version_log():
     return {"current_version": db.get_version(), "log": db.version_log()}
+
+
+# --------------------------------------------------------------------------- #
+# 跨组亲属泄漏审查
+#
+# 审查是只读计算：合并已发布清单（病例/分组/亲属）与本次上传的补充病例、
+# 新增亲属对，在内存中建患者关系图。审查不产生新输入版本、不改任何输入，
+# 也不改变清单状态；仅在 leak_reviews 审计表记录结论本身。
+# 计算期间版本或清单失效 -> 409，不返回任何可用结论。
+# --------------------------------------------------------------------------- #
+def _require_valid_manifest(manifest_id: str):
+    manifest = db.get_manifest(manifest_id)
+    if manifest is None:
+        raise HTTPException(status_code=404, detail="清单不存在。")
+    if manifest["expired"]:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "所选的清单已失效（输入已变动或已被标记失效），"
+                "不能用于泄漏审查。请重新求解并发布清单后再审查。"
+            ),
+        )
+    return manifest
+
+
+@app.get("/api/leak-reviews")
+def leak_reviews(manifest_id: str | None = None):
+    return {
+        "dataset_version": db.get_version(),
+        "reviews": db.list_leak_reviews(manifest_id),
+    }
+
+
+@app.post("/api/leak-review")
+async def run_leak_review(
+    manifest_id: str = Form(...),
+    cases_file: UploadFile = File(...),
+    relatives_file: UploadFile | None = File(None),
+):
+    manifest = _require_valid_manifest(manifest_id)
+    version = db.get_version()
+    if manifest["dataset_version"] != version:
+        raise HTTPException(
+            status_code=409,
+            detail="清单与当前输入版本不一致，清单已失效，不能用于审查。",
+        )
+
+    cases_raw = await _read_upload(cases_file)
+    known_patients = [c["patient_id"] for c in manifest["input"]["cases"]]
+    supplement_cases = parse_supplement_cases_csv(
+        cases_raw, [c["case_id"] for c in manifest["input"]["cases"]]
+    )
+    known_patients.extend(c.patient_id for c in supplement_cases)
+
+    relatives_raw = b""
+    if relatives_file is not None:
+        relatives_raw = await relatives_file.read()
+        if len(relatives_raw) > 2 * 1024 * 1024:
+            raise ValidationError(["上传文件超过 2MB 限制。"])
+    supplement_relatives = parse_supplement_relatives_csv(
+        relatives_raw, known_patients
+    )
+
+    result = review_leakage(manifest, supplement_cases, supplement_relatives)
+
+    # 复核：审查计算期间清单/输入若失效，结论作废，不返回可用结论。
+    # save_leak_review 在 BEGIN IMMEDIATE 内再次核对版本与 invalidated 标记。
+    supplement_snapshot = {
+        "cases": [
+            {
+                "case_id": c.case_id,
+                "patient_id": c.patient_id,
+                "target_group": c.target_group,
+            }
+            for c in supplement_cases
+        ],
+        "relatives": [
+            {"patient_a": r.patient_a, "patient_b": r.patient_b}
+            for r in supplement_relatives
+        ],
+    }
+    record = db.save_leak_review(
+        manifest_id=manifest["manifest_id"],
+        expected_version=version,
+        supplement=supplement_snapshot,
+        result=result,
+    )
+    return {
+        "review_id": record["review_id"],
+        "created_at": record["created_at"],
+        "dataset_version": version,
+        "manifest_id": manifest["manifest_id"],
+        "manifest_created_at": manifest["created_at"],
+        "supplement": supplement_snapshot,
+        "result": result,
+    }
+
+
+@app.get("/api/leak-review/template/cases")
+def leak_review_cases_template():
+    csv_text = "病例号,患者号,目标分组\nN001,P101,1\nN002,P101,2\nN003,P102,1\n"
+    return PlainTextResponse(
+        "﻿" + csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="supplement_cases_template.csv"'},
+    )
+
+
+@app.get("/api/leak-review/template/relatives")
+def leak_review_relatives_template():
+    csv_text = "患者A,患者B\nP101,P001\n"
+    return PlainTextResponse(
+        "﻿" + csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="supplement_relatives_template.csv"'},
+    )
 
 
 # 静态前端（最后挂载，避免覆盖 /api 路由）

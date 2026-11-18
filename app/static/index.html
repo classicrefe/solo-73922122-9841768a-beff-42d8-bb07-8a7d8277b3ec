@@ -25,7 +25,8 @@
   <button class="tab" data-tab="quota">② 配额与锁定</button>
   <button class="tab" data-tab="solve">③ 求解与发布</button>
   <button class="tab" data-tab="manifests">④ 已发布清单</button>
-  <button class="tab" data-tab="log">⑤ 版本记录</button>
+  <button class="tab" data-tab="leak">⑤ 泄漏审查</button>
+  <button class="tab" data-tab="log">⑥ 版本记录</button>
 </nav>
 
 <!-- ======================= Tab 1 数据 ======================= -->
@@ -168,7 +169,73 @@
   </div>
 </section>
 
-<!-- ======================= Tab 5 日志 ======================= -->
+<!-- ======================= Tab 5 泄漏审查 ======================= -->
+<section class="panel" id="tab-leak">
+  <h2>跨训练集/评估集亲属泄漏审查</h2>
+  <p class="hint">选择一份<b>有效</b>已发布清单，上传补充病例 CSV（<code>病例号,患者号,目标分组</code>，
+    目标分组 1=训练集 / 2=评估集，至多 200 行）与可选的新增亲属对 CSV
+    （<code>患者A,患者B</code>，至多 200 行，可留空）。
+    审查会把清单中的同患者关系、清单亲属对与本次新增关系合并成一张患者关系图；
+    只要关系链把不同组的病例连通，即判为跨组泄漏。审查只读：<b>不会改动输入、版本或清单</b>。
+    <a href="/api/leak-review/template/cases">下载补充病例模板</a> ·
+    <a href="/api/leak-review/template/relatives">下载新增亲属对模板</a></p>
+
+  <div class="row">
+    <label>有效清单：
+      <select id="leakManifest" style="min-width: 320px"></select>
+    </label>
+    <span id="leakManifestHint" class="hint"></span>
+  </div>
+
+  <div class="row">
+    <label>补充病例 CSV：<input type="file" id="leakCasesFile" accept=".csv,text/csv"></label>
+  </div>
+  <div class="row">
+    <label>新增亲属对 CSV（可选）：
+      <input type="file" id="leakRelFile" accept=".csv,text/csv"></label>
+  </div>
+  <div class="row">
+    <button class="primary" onclick="runLeakReview()">运行泄漏审查</button>
+    <span class="hint">若审查期间输入或所选清单失效，本次结论作废（HTTP 409），不会返回可用结论或存档。</span>
+    <span id="leakMsg" class="msg"></span>
+  </div>
+
+  <div id="leakResultBox" class="hidden">
+    <div id="leakConclusion" class="banner"></div>
+    <div id="leakStats" class="grid4"></div>
+
+    <div id="leakAffectedBox" class="hidden">
+      <h2>受影响的补充病例（通向相反组病例的最短原始关系路径）</h2>
+      <div id="leakAffected"></div>
+    </div>
+
+    <div id="leakManifestConflictBox" class="hidden">
+      <h2>新增关系造成的清单内部冲突</h2>
+      <p class="hint">以下清单连通分量在原清单中分属不同组，但新增亲属关系把它们连成同一分量。
+        清单本身仍保持已发布状态；本提示仅用于指出该清单已不再满足分组约束。
+        每个分量展示距离最近的一对病例及其关系路径，并标出造成冲突的新增亲属对。</p>
+      <div id="leakManifestConflicts"></div>
+    </div>
+
+    <div id="leakCleanBox" class="hidden">
+      <h2>未发现跨组泄漏的补充病例</h2>
+      <div class="table-wrap">
+        <table id="leakCleanTable"><thead>
+          <tr><th>病例号</th><th>患者号</th><th>目标分组</th></tr>
+        </thead><tbody></tbody></table>
+      </div>
+    </div>
+  </div>
+
+  <h2>审查记录（仅存档结论，不改动输入与清单）</h2>
+  <div class="table-wrap">
+    <table id="leakHistoryTable"><thead>
+      <tr><th>审查 ID</th><th>清单</th><th>输入版本</th><th>补充病例</th><th>结论</th><th>时间 (UTC)</th></tr>
+    </thead><tbody></tbody></table>
+  </div>
+</section>
+
+<!-- ======================= Tab 6 日志 ======================= -->
 <section class="panel" id="tab-log">
   <h2>输入版本变动记录</h2>
   <div class="table-wrap">
